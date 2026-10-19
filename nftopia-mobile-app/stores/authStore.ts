@@ -3,8 +3,9 @@ import { AuthStore, User } from '@/types/auth';
 import { Wallet } from '@/src/services/stellar/types';
 import { walletAuthService } from '@/src/services/auth/walletAuth.service';
 import { tokenStorage } from '@/src/services/auth/tokenStorage';
+import { useWalletStore } from '@/stores/walletStore';
 
-export const VERSION = 2;
+export const VERSION = 3;
 
 // Migrations for auth store
 const migrations = [
@@ -28,7 +29,26 @@ const migrations = [
       };
     },
   },
+  {
+    version: 3,
+    up: (state: any) => {
+      // Add app-lock preferences (#399) — off by default so nobody who
+      // upgrades is unexpectedly locked out.
+      return {
+        ...state,
+        appLockEnabled: state.appLockEnabled ?? false,
+        lockTimeout: state.lockTimeout ?? 60,
+      };
+    },
+  },
 ];
+
+/** Default: warn 5 minutes before expiry. */
+const DEFAULT_WARNING_THRESHOLD_SECONDS = 300;
+/** Default: re-lock after 60s in the background, once app-lock is enabled. */
+const DEFAULT_LOCK_TIMEOUT_SECONDS = 60;
+const MAX_UNLOCK_ATTEMPTS = 5;
+const LOCKOUT_DURATION_MS = 30_000;
 
 const initialState: AuthStore = {
   user: null,
@@ -40,6 +60,15 @@ const initialState: AuthStore = {
   isCheckingAuth: true,
   lastLogin: null,
 
+  sessionExpiryTime: null,
+  warningThreshold: DEFAULT_WARNING_THRESHOLD_SECONDS,
+  showExpiryWarning: false,
+  isLocked: false,
+  lockTimeout: DEFAULT_LOCK_TIMEOUT_SECONDS,
+  failedUnlockAttempts: 0,
+  lockoutUntil: null,
+  appLockEnabled: false,
+
   setUser: () => {},
   setWallet: () => {},
   setLoading: () => {},
@@ -50,10 +79,28 @@ const initialState: AuthStore = {
   initializeAuth: async () => {},
   loginWithWallet: async () => {},
   logout: async () => {},
+  refreshSession: async () => false,
+  setShowExpiryWarning: () => {},
+  setWarningThreshold: () => {},
+  setLockTimeout: () => {},
+  setAppLockEnabled: () => {},
+  extendSession: async () => false,
+  getSessionTimeRemaining: () => null,
+  checkSessionExpiry: () => false,
+  lockApp: () => {},
+  unlockApp: async () => false,
+  resetFailedAttempts: () => {},
+  isInLockout: () => false,
+  getLockoutRemaining: () => 0,
   navigateToScreen: () => {},
   goBack: () => {},
   resetToScreen: () => {},
 };
+
+let refreshPromise: Promise<boolean> | null = null;
+let sessionGeneration = 0;
+let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+const REFRESH_BUFFER_SECONDS = 120;
 
 export const useAuthStore = createStore<AuthStore>({
   name: 'auth-store',
@@ -82,23 +129,44 @@ export const useAuthStore = createStore<AuthStore>({
       set({ isCheckingAuth: true, loading: true });
       try {
         const hasValidSession = await tokenStorage.hasValidSession();
+        let sessionValid = false;
+
         if (hasValidSession) {
-          // `user`/`isAuthenticated` were already restored from persisted
-          // state by the store's persist middleware — this just confirms
-          // the access token backing that session is still valid.
-          set({ isAuthenticated: true });
+          sessionValid = true;
         } else {
           const refreshToken = await tokenStorage.getRefreshToken();
           if (refreshToken) {
             try {
-              await walletAuthService.refreshAccessToken();
-              set({ isAuthenticated: true });
+              sessionValid = await get().refreshSession();
             } catch {
-              set({ isAuthenticated: false, user: null, wallet: null });
+              sessionValid = false;
             }
-          } else {
-            set({ isAuthenticated: false });
           }
+        }
+
+        if (sessionValid) {
+          // A token that's locally unexpired can still have been revoked
+          // server-side (password change, admin action, blacklisted after
+          // logout on another device) — confirm with the server rather
+          // than trusting the local expiry check alone.
+          try {
+            await walletAuthService.validateSession();
+          } catch {
+            sessionValid = false;
+          }
+        }
+
+        if (sessionValid) {
+          const expiry = await tokenStorage.getTokenExpiryTime();
+          set({
+            isAuthenticated: true,
+            sessionExpiryTime: expiry,
+            isLocked: get().appLockEnabled,
+          });
+        } else {
+          await tokenStorage.clearTokens();
+          useWalletStore.getState().disconnectWallet();
+          set({ isAuthenticated: false, user: null, wallet: null, sessionExpiryTime: null });
         }
       } catch (error) {
         set({
@@ -112,9 +180,15 @@ export const useAuthStore = createStore<AuthStore>({
 
     // Full challenge -> sign -> verify wallet login, replacing any prior session.
     loginWithWallet: async (wallet: Wallet) => {
+      sessionGeneration++;
+      clearTimeout(refreshTimer);
       set({ loading: true, error: null });
       try {
         const authResponse = await walletAuthService.walletLogin(wallet);
+        if (authResponse?.access_token && authResponse?.refresh_token) {
+          await tokenStorage.saveTokens(authResponse.access_token, authResponse.refresh_token);
+        }
+        const expiry = await tokenStorage.getTokenExpiryTime();
         set({
           user: {
             id: authResponse.user.id,
@@ -125,27 +199,37 @@ export const useAuthStore = createStore<AuthStore>({
           wallet,
           isAuthenticated: true,
           isCreator: false,
-          loading: false,
           lastLogin: new Date().toISOString(),
+          sessionExpiryTime: expiry,
+          isLocked: false,
+          failedUnlockAttempts: 0,
+          lockoutUntil: null,
         });
       } catch (error) {
         set({
           error: error instanceof Error ? error.message : 'Failed to sign in with wallet',
-          loading: false,
+          isAuthenticated: false,
         });
         // Re-throw so the calling screen (which owns its own submit/loading
         // UI) knows not to proceed past the login step.
         throw error;
+      } finally {
+        set({ loading: false });
       }
     },
 
     logout: async () => {
+      sessionGeneration++;
+      clearTimeout(refreshTimer);
       try {
         set({ loading: true });
-        // Only the auth session is cleared here — the wallet's keys stay on
-        // device (via the separate wallet store) so the user can sign back
-        // in without re-entering their secret key or recovery phrase.
+        // The auth session (tokens) and the wallet *connection* are
+        // cleared here — the wallet's keys stay on device (via the
+        // separate wallet store's `disconnectWallet`, not `clearWallets`)
+        // so the user can sign back in without re-entering their secret
+        // key or recovery phrase.
         await tokenStorage.clearTokens();
+        useWalletStore.getState().disconnectWallet();
       } catch (error) {
         set({
           error: error instanceof Error ? error.message : 'Failed to logout',
@@ -158,8 +242,106 @@ export const useAuthStore = createStore<AuthStore>({
           isCreator: false,
           loading: false,
           error: null,
+          sessionExpiryTime: null,
+          showExpiryWarning: false,
+          isLocked: false,
+          failedUnlockAttempts: 0,
+          lockoutUntil: null,
         });
       }
+    },
+
+    // Session timeout / app-lock actions
+    setShowExpiryWarning: (show: boolean) => set({ showExpiryWarning: show }),
+    setWarningThreshold: (seconds: number) => set({ warningThreshold: seconds }),
+    setLockTimeout: (seconds: number) => set({ lockTimeout: seconds }),
+    setAppLockEnabled: (enabled: boolean) => set({ appLockEnabled: enabled }),
+
+    // Every automatic/manual refresh shares the same rotation request.
+    refreshSession: () => {
+      if (refreshPromise) return refreshPromise;
+      const generation = sessionGeneration;
+      refreshPromise = (async () => {
+        try {
+          await walletAuthService.refreshAccessToken(() => generation === sessionGeneration);
+          if (generation !== sessionGeneration) return false;
+          const expiry = await tokenStorage.getTokenExpiryTime();
+          set({ sessionExpiryTime: expiry, showExpiryWarning: false, error: null });
+          return true;
+        } catch {
+          if (generation === sessionGeneration) {
+            await get().logout();
+            set({ error: 'Your session could not be refreshed. Please sign in again.' });
+          }
+          return false;
+        } finally {
+          refreshPromise = null;
+        }
+      })();
+      return refreshPromise;
+    },
+
+    extendSession: () => get().refreshSession(),
+
+    getSessionTimeRemaining: (): number | null => {
+      const { sessionExpiryTime } = get();
+      if (!sessionExpiryTime) return null;
+      const now = Math.floor(Date.now() / 1000);
+      const remaining = sessionExpiryTime - now;
+      return remaining > 0 ? remaining : 0;
+    },
+
+    checkSessionExpiry: (): boolean => {
+      const remaining = get().getSessionTimeRemaining();
+      return remaining === null ? false : remaining <= 0;
+    },
+
+    lockApp: () => set({ isLocked: true }),
+
+    // `pin` is accepted for forward-compatibility with a future PIN-entry
+    // flow; there's no PIN storage/verification implemented yet, so a PIN
+    // attempt always counts as a failure rather than silently pretending
+    // to check one. Calling with no `pin` is the biometric-success path
+    // (the caller has already run the biometric prompt itself).
+    unlockApp: async (pin?: string): Promise<boolean> => {
+      const { appLockEnabled, failedUnlockAttempts } = get();
+
+      if (!appLockEnabled) {
+        set({ isLocked: false });
+        return true;
+      }
+
+      if (get().isInLockout()) {
+        return false;
+      }
+
+      if (pin) {
+        const attempts = failedUnlockAttempts + 1;
+        if (attempts >= MAX_UNLOCK_ATTEMPTS) {
+          set({ lockoutUntil: Date.now() + LOCKOUT_DURATION_MS, failedUnlockAttempts: 0 });
+        } else {
+          set({ failedUnlockAttempts: attempts });
+        }
+        return false;
+      }
+
+      set({ isLocked: false, failedUnlockAttempts: 0, lockoutUntil: null });
+      return true;
+    },
+
+    resetFailedAttempts: () => set({ failedUnlockAttempts: 0, lockoutUntil: null }),
+
+    isInLockout: (): boolean => {
+      const { lockoutUntil } = get();
+      if (!lockoutUntil) return false;
+      return Date.now() < lockoutUntil;
+    },
+
+    getLockoutRemaining: (): number => {
+      const { lockoutUntil } = get();
+      if (!lockoutUntil) return 0;
+      const remaining = Math.ceil((lockoutUntil - Date.now()) / 1000);
+      return remaining > 0 ? remaining : 0;
     },
 
     // Navigation Actions
@@ -193,11 +375,26 @@ export const useAuthStore = createStore<AuthStore>({
       isAuthenticated: state.isAuthenticated,
       isCreator: state.isCreator,
       lastLogin: state.lastLogin,
+      appLockEnabled: state.appLockEnabled,
+      lockTimeout: state.lockTimeout,
     }),
-    storage: 'secure', // Use secure storage for auth
+    // Encrypted (not just SecureStore's own at-rest encryption) since this
+    // includes `user` — see `createEncryptedStorage` in persistence.utils.ts.
+    storage: 'encrypted',
   },
   devtools: {
     enabled: __DEV__,
     name: 'AuthStore',
   },
+});
+
+// One timer per store, independent of how many screens use the auth hook.
+useAuthStore.subscribe((state, previous) => {
+  if (state.isAuthenticated === previous.isAuthenticated &&
+      state.sessionExpiryTime === previous.sessionExpiryTime) return;
+  clearTimeout(refreshTimer);
+  if (!state.isAuthenticated || state.sessionExpiryTime === null) return;
+  const delay = Math.max(1000, (state.sessionExpiryTime - REFRESH_BUFFER_SECONDS) * 1000 - Date.now());
+  refreshTimer = setTimeout(() => { void useAuthStore.getState().refreshSession(); },
+    Math.min(delay, 2_147_483_647));
 });

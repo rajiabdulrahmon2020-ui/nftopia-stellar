@@ -7,6 +7,7 @@ import {
   AuthResponse,
   ChallengeResponse,
   LinkWalletResponse,
+  User,
 } from './types';
 
 const NETWORK_RETRY_ATTEMPTS = 1;
@@ -18,7 +19,7 @@ export class WalletAuthService {
 
   constructor(walletService?: StellarWalletService, baseUrl?: string) {
     this.walletService = walletService ?? new StellarWalletService();
-    this.baseUrl = baseUrl ?? 'http://localhost:3000';
+    this.baseUrl = baseUrl ?? process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:3000/api/v1';
   }
 
   async getChallenge(walletAddress: string): Promise<ChallengeResponse> {
@@ -120,7 +121,7 @@ export class WalletAuthService {
   }
 
   /** Exchanges the stored refresh token for a new access/refresh pair. */
-  async refreshAccessToken(): Promise<AuthResponse> {
+  async refreshAccessToken(isCurrentSession: () => boolean = () => true): Promise<AuthResponse> {
     const refreshToken = await tokenStorage.getRefreshToken();
     if (!refreshToken) {
       throw new AuthError(
@@ -129,9 +130,12 @@ export class WalletAuthService {
       );
     }
 
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30_000);
     try {
-      const response = await this._fetchWithRetry(`${this.baseUrl}/auth/refresh`, {
+      const response = await fetch(`${this.baseUrl}/auth/refresh`, {
         method: 'POST',
+        signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ refreshToken }),
       });
@@ -144,13 +148,59 @@ export class WalletAuthService {
         );
       }
 
-      const authResponse = (await response.json()) as AuthResponse;
+      const body = await response.json();
+      const authResponse: AuthResponse = body?.data?.data ?? body;
+      if (!authResponse?.access_token || !authResponse?.refresh_token) {
+        throw new AuthError('Invalid refresh response', AuthErrorCode.AUTHENTICATION_FAILED);
+      }
+      if (!isCurrentSession()) {
+        throw new AuthError('Session ended', AuthErrorCode.AUTHENTICATION_FAILED);
+      }
       await this._storeTokens(authResponse.access_token, authResponse.refresh_token);
       return authResponse;
     } catch (err) {
       if (err instanceof AuthError) throw err;
       throw new AuthError(
         `Failed to refresh token: ${(err as Error).message}`,
+        AuthErrorCode.NETWORK_ERROR,
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  /**
+   * Confirms the stored access token is still accepted by the server (not
+   * just locally unexpired) by fetching the authenticated user's profile.
+   * Used by `initializeAuth()` — a token that decodes as locally
+   * unexpired can still have been revoked server-side (password change,
+   * admin action, blacklisted after logout elsewhere).
+   */
+  async validateSession(): Promise<User> {
+    const accessToken = await tokenStorage.getAccessToken();
+    if (!accessToken) {
+      throw new AuthError('No access token available', AuthErrorCode.AUTHENTICATION_FAILED);
+    }
+
+    try {
+      const response = await this._fetchWithRetry(`${this.baseUrl}/auth/me`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+
+      if (!response.ok) {
+        throw new AuthError(
+          `Session validation failed with status ${response.status}`,
+          AuthErrorCode.AUTHENTICATION_FAILED,
+        );
+      }
+
+      const body = (await response.json()) as { data: { data: User } };
+      return body.data.data;
+    } catch (err) {
+      if (err instanceof AuthError) throw err;
+      throw new AuthError(
+        `Failed to validate session: ${(err as Error).message}`,
         AuthErrorCode.NETWORK_ERROR,
       );
     }

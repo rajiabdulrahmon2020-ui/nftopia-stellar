@@ -29,6 +29,7 @@ describe("TokenStorage", () => {
   beforeEach(() => {
     storage = new TokenStorage();
     jest.clearAllMocks();
+    mockSecureStore.deleteItemAsync.mockResolvedValue(undefined);
   });
 
   it("saves both tokens to secure storage", async () => {
@@ -44,6 +45,30 @@ describe("TokenStorage", () => {
       "nftopia_refresh_token",
       "refresh-xyz",
     );
+  });
+
+  it("removes stale expiry when a replacement token has no valid expiry", async () => {
+    const jwt = `h.${Buffer.from(JSON.stringify({ exp: 2000000000 })).toString('base64url')}.s`;
+    await storage.saveTokens(jwt, 'refresh');
+    expect(await storage.getTokenExpiryTime()).toBe(2000000000);
+    await storage.saveTokens('opaque-token', 'rotated');
+    expect(mockSecureStore.deleteItemAsync).toHaveBeenCalledWith('nftopia_token_expiry');
+  });
+
+  it("finishes pending token writes before clearing on logout", async () => {
+    let release!: () => void;
+    mockSecureStore.setItemAsync.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    const saving = storage.saveTokens('access', 'refresh');
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    const clearing = storage.clearTokens();
+    release();
+    await Promise.all([saving, clearing]);
+    expect(mockSecureStore.deleteItemAsync).toHaveBeenCalledWith('nftopia_access_token');
+    expect(mockSecureStore.deleteItemAsync).toHaveBeenCalledWith('nftopia_refresh_token');
+    mockSecureStore.getItemAsync.mockResolvedValue(null);
+    expect(await storage.getAccessToken()).toBeNull();
   });
 
   it("reads the access token from storage", async () => {
@@ -215,6 +240,69 @@ describe("TokenStorage", () => {
       );
 
       expect(await storage.hasValidSession()).toBe(true);
+    });
+  });
+
+  describe("biometric protection (#399)", () => {
+    it("saves without requireAuthentication when the biometric preference is off (default)", async () => {
+      mockAsyncStorage.getItem.mockResolvedValue(null); // no 'biometric_enabled' entry -> off
+      mockSecureStore.setItemAsync.mockResolvedValue(undefined);
+
+      await storage.saveTokens("access-abc", "refresh-xyz");
+
+      expect(mockSecureStore.setItemAsync).toHaveBeenCalledWith(
+        "nftopia_access_token",
+        "access-abc",
+      );
+    });
+
+    it("saves with requireAuthentication when the biometric preference is on", async () => {
+      mockAsyncStorage.getItem.mockImplementation((key: string) =>
+        Promise.resolve(key === "biometric_enabled" ? "true" : null),
+      );
+      mockSecureStore.setItemAsync.mockResolvedValue(undefined);
+
+      await storage.saveTokens("access-abc", "refresh-xyz");
+
+      expect(mockSecureStore.setItemAsync).toHaveBeenCalledWith(
+        "nftopia_access_token",
+        "access-abc",
+        expect.objectContaining({ requireAuthentication: true }),
+      );
+    });
+
+    it("does not re-prompt (re-hit SecureStore) for a value already read this session", async () => {
+      mockAsyncStorage.getItem.mockResolvedValue(null);
+      mockSecureStore.getItemAsync.mockResolvedValue("access-abc");
+
+      await storage.getAccessToken();
+      await storage.getAccessToken();
+
+      // The token backend call itself only happened once; the second read
+      // was served from the in-memory session cache.
+      expect(mockSecureStore.getItemAsync).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not cache a null result — a later save is still observed", async () => {
+      mockAsyncStorage.getItem.mockResolvedValue(null);
+      mockSecureStore.getItemAsync.mockResolvedValue(null);
+      expect(await storage.getAccessToken()).toBeNull();
+
+      mockSecureStore.setItemAsync.mockResolvedValue(undefined);
+      await storage.saveTokens("access-abc", "refresh-xyz");
+
+      expect(await storage.getAccessToken()).toBe("access-abc");
+    });
+
+    it("clears the session cache on clearTokens — a subsequent read hits storage again", async () => {
+      mockAsyncStorage.getItem.mockResolvedValue(null);
+      mockSecureStore.getItemAsync.mockResolvedValue("access-abc");
+      await storage.getAccessToken();
+
+      await storage.clearTokens();
+
+      mockSecureStore.getItemAsync.mockResolvedValue(null);
+      expect(await storage.getAccessToken()).toBeNull();
     });
   });
 });

@@ -12,6 +12,11 @@ import {
   buildModerationTools,
   MODERATION_TOOL_NAMES,
 } from './moderation.tools';
+import {
+  buildCreatorCopilotTools,
+  CREATOR_COPILOT_TOOL_NAMES,
+} from './creator-copilot.tools';
+import { buildTradingTools, TRADING_TOOL_NAMES } from './trading.tools';
 import type { RunnableToolLike, ToolSetName } from './tool-set.types';
 
 const fakeDeps = {
@@ -25,6 +30,15 @@ const fakeDeps = {
 
 const fakeModerationDeps = {
   contentFlagService: {} as never,
+  expectedEntity: { entityType: 'listing' as const, entityId: 'listing-1' },
+};
+
+const fakeCreatorCopilotDeps = {
+  expectedNftId: 'nft-1',
+};
+
+const fakeTradingDeps = {
+  userId: 'user-1',
 };
 
 /** Minimal stand-in for a resolved tool — only `.name` is read by the guard. */
@@ -103,8 +117,86 @@ describe('tool-set.registry', () => {
     });
   });
 
+  describe('resolveToolSet("creator-copilot") (#528)', () => {
+    it('returns exactly the tools declared in CREATOR_COPILOT_TOOL_NAMES', () => {
+      const tools = resolveToolSet('creator-copilot', fakeCreatorCopilotDeps);
+      const names = tools.map((tool) => tool.name).sort();
+
+      expect(names).toEqual([...CREATOR_COPILOT_TOOL_NAMES].sort());
+    });
+
+    it('does not throw', () => {
+      expect(() =>
+        resolveToolSet('creator-copilot', fakeCreatorCopilotDeps),
+      ).not.toThrow();
+    });
+  });
+
+  describe('CREATOR_COPILOT_TOOL_NAMES', () => {
+    it('has no duplicates', () => {
+      expect(new Set(CREATOR_COPILOT_TOOL_NAMES).size).toBe(
+        CREATOR_COPILOT_TOOL_NAMES.length,
+      );
+    });
+
+    it('matches exactly what buildCreatorCopilotTools actually returns (no drift)', () => {
+      const actualNames = buildCreatorCopilotTools(fakeCreatorCopilotDeps)
+        .map((tool) => tool.name)
+        .sort();
+
+      expect(actualNames).toEqual([...CREATOR_COPILOT_TOOL_NAMES].sort());
+    });
+
+    it('does not appear in the marketplace-assistant tool set', () => {
+      const marketplaceNames = resolveToolSet(
+        'marketplace-assistant',
+        fakeDeps,
+      ).map((tool) => tool.name);
+
+      expect(marketplaceNames).not.toContain('draft_listing');
+    });
+  });
+
+  describe('resolveToolSet("trading") (#641)', () => {
+    it('returns exactly the tools declared in TRADING_TOOL_NAMES', () => {
+      const tools = resolveToolSet('trading', fakeTradingDeps);
+      const names = tools.map((tool) => tool.name).sort();
+
+      expect(names).toEqual([...TRADING_TOOL_NAMES].sort());
+    });
+
+    it('does not throw', () => {
+      expect(() => resolveToolSet('trading', fakeTradingDeps)).not.toThrow();
+    });
+  });
+
+  describe('TRADING_TOOL_NAMES', () => {
+    it('has no duplicates', () => {
+      expect(new Set(TRADING_TOOL_NAMES).size).toBe(TRADING_TOOL_NAMES.length);
+    });
+
+    it('matches exactly what buildTradingTools actually returns (no drift)', () => {
+      const actualNames = buildTradingTools(fakeTradingDeps)
+        .map((tool) => tool.name)
+        .sort();
+
+      expect(actualNames).toEqual([...TRADING_TOOL_NAMES].sort());
+    });
+
+    it('does not appear in the marketplace-assistant tool set', () => {
+      const marketplaceNames = resolveToolSet(
+        'marketplace-assistant',
+        fakeDeps,
+      ).map((tool) => tool.name);
+
+      for (const name of TRADING_TOOL_NAMES) {
+        expect(marketplaceNames).not.toContain(name);
+      }
+    });
+  });
+
   describe('resolveToolSet for an unregistered tool set', () => {
-    it.each<ToolSetName>(['creator-copilot', 'trading'])(
+    it.each<ToolSetName>(['unregistered-toolset' as ToolSetName])(
       'throws for "%s" since no builder is registered yet',
       (name) => {
         expect(() => resolveToolSet(name, fakeDeps)).toThrow(
@@ -150,13 +242,15 @@ describe('tool-set.registry', () => {
   });
 
   describe('scope isolation across tool sets registered in the same process', () => {
+    // Uses a throwaway sandbox name so as not to clobber real registrations (#641).
+    const sandboxToolSet = 'sandbox-toolset' as ToolSetName;
     afterEach(() => {
-      unregisterToolSet('creator-copilot');
+      unregisterToolSet(sandboxToolSet);
     });
 
     it('does not leak another registered tool set into marketplace-assistant', () => {
-      registerToolSet('creator-copilot', () => [fakeTool('draft_listing')], [
-        'draft_listing',
+      registerToolSet(sandboxToolSet, () => [fakeTool('sandbox_tool')], [
+        'sandbox_tool',
       ]);
 
       const marketplaceTools = resolveToolSet(
@@ -165,30 +259,30 @@ describe('tool-set.registry', () => {
       );
       const marketplaceNames = marketplaceTools.map((tool) => tool.name);
 
-      expect(marketplaceNames).not.toContain('draft_listing');
+      expect(marketplaceNames).not.toContain('sandbox_tool');
       expect(marketplaceNames.sort()).toEqual(
         [...MARKETPLACE_TOOL_NAMES].sort(),
       );
     });
 
     it('resolves the other tool set on its own, unaffected by marketplace-assistant', () => {
-      registerToolSet('creator-copilot', () => [fakeTool('draft_listing')], [
-        'draft_listing',
+      registerToolSet(sandboxToolSet, () => [fakeTool('sandbox_tool')], [
+        'sandbox_tool',
       ]);
 
-      const copilotTools = resolveToolSet('creator-copilot', fakeDeps);
+      const sandboxTools = resolveToolSet(sandboxToolSet, fakeDeps);
 
-      expect(copilotTools.map((tool) => tool.name)).toEqual(['draft_listing']);
+      expect(sandboxTools.map((tool) => tool.name)).toEqual(['sandbox_tool']);
     });
 
     it('catches a tool set builder pulling in a tool it never declared', () => {
       registerToolSet(
-        'creator-copilot',
-        () => [fakeTool('draft_listing'), fakeTool('search_nfts')], // 'search_nfts' undeclared here
-        ['draft_listing'],
+        sandboxToolSet,
+        () => [fakeTool('sandbox_tool'), fakeTool('search_nfts')], // 'search_nfts' undeclared here
+        ['sandbox_tool'],
       );
 
-      expect(() => resolveToolSet('creator-copilot', fakeDeps)).toThrow(
+      expect(() => resolveToolSet(sandboxToolSet, fakeDeps)).toThrow(
         /search_nfts/,
       );
     });

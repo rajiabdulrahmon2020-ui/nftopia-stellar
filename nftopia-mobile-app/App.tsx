@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { SafeAreaView, StatusBar, StyleSheet, Text, View, ActivityIndicator } from 'react-native';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { ApolloProvider, ApolloClient, NormalizedCacheObject } from '@apollo/client';
 import AppNavigator from './navigation/AppNavigator';
 import AppLayout from './app/_layout';
@@ -22,30 +24,39 @@ export default function App() {
 
   if (!client) {
     return (
-      <View style={[styles.container, styles.loadingContainer]}>
-        <ActivityIndicator size="large" color="#0000ff" />
-      </View>
+      <GestureHandlerRootView style={styles.container}>
+        <View style={[styles.container, styles.loadingContainer]}>
+          <ActivityIndicator size="large" color="#0000ff" />
+        </View>
+      </GestureHandlerRootView>
     );
   }
 
   return (
-    <ApolloProvider client={client}>
-      <AppLayout>
-        <PrivacyOverlay />
-        <AppLockManager>
-          <VersionCheckManager />
-          <SafeAreaView style={styles.container}>
-            <StatusBar barStyle="dark-content" backgroundColor="#ffffff" />
-            <NetworkStatusManager />
-            <SessionManager />
-            <BackupReminderManager />
-            <ConnectivityBanner />
-            <AppNavigator />
-            <ToastProvider />
-          </SafeAreaView>
-        </AppLockManager>
-      </AppLayout>
-    </ApolloProvider>
+    // Required by react-native-gesture-handler v2 (and by extension
+    // @gorhom/bottom-sheet, which is built on it) — must wrap the entire
+    // gesture-responding tree, as close to the root as possible (#469).
+    <GestureHandlerRootView style={styles.container}>
+      <SafeAreaProvider>
+        <ApolloProvider client={client}>
+          <AppLayout>
+            <PrivacyOverlay />
+            <AppLockManager>
+              <VersionCheckManager />
+              <SafeAreaView style={styles.container}>
+                <StatusBar barStyle="dark-content" backgroundColor="#ffffff" />
+                <NetworkStatusManager />
+                <SessionManager />
+                <BackupReminderManager />
+                <ConnectivityBanner />
+                <AppNavigator />
+                <ToastProvider />
+              </SafeAreaView>
+            </AppLockManager>
+          </AppLayout>
+        </ApolloProvider>
+      </SafeAreaProvider>
+    </GestureHandlerRootView>
   );
 }
 

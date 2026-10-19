@@ -38,6 +38,7 @@ export class AdminAiFlagsController {
   async list(@Query() query: ListContentFlagsQueryDto) {
     return this.contentFlagService.listFlags({
       status: query.status ?? 'pending',
+      entityType: query.entityType,
       limit: query.limit,
       offset: query.offset,
     });
@@ -56,6 +57,7 @@ export class AdminAiFlagsController {
       reviewedBy: user.userId,
       ipAddress: req.ip,
       userAgent: req.get('user-agent'),
+      ...(body.reason !== undefined ? { reason: body.reason } : {}),
     });
   }
 }

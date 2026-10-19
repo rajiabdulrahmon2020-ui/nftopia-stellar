@@ -4,11 +4,11 @@
  * declare which set they use instead of implicitly receiving every tool
  * that exists (see the README in this directory).
  *
- * Only 'marketplace-assistant' is implemented today. The others are
- * reserved for endpoints already named in the backlog (creator co-pilot
- * drafts, moderation flags, trading proposals) so the type — and the
- * requirement that every endpoint pick one explicitly — is in place
- * before those tool sets land.
+ * Implemented sets:
+ * - 'marketplace-assistant': read-only marketplace queries
+ * - 'creator-copilot': draft listing suggestions for creators (#528)
+ * - 'moderation': automated content flag generation (#527)
+ * - 'trading': write-capable trade proposals scoped to caller (#641)
  */
 import type { BetaRunnableTool } from '@anthropic-ai/sdk/lib/tools/BetaRunnableTool';
 
@@ -25,8 +25,15 @@ export type ToolSetName =
  */
 export type RunnableToolLike = BetaRunnableTool<any>;
 
+export type ToolLogger = (
+  toolName: string,
+  args: Record<string, unknown>,
+  resultSummary: string,
+  durationMs: number,
+) => void;
+
 export type ToolSetBuilder<TDeps = unknown> = (
-  deps: TDeps,
+  deps: TDeps & { toolLogger?: ToolLogger },
 ) => RunnableToolLike[];
 
 export interface ToolSetRegistration<TDeps = unknown> {

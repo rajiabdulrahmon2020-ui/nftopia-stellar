@@ -4,14 +4,18 @@ import { useTranslation } from 'react-i18next';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import type { MainStackParamList } from '@/navigation/MainNavigator';
 import { useWalletConnect } from '@/hooks/useWalletConnect';
-import { useAuthStore } from '@/src/stores/authStore';
+import { useAuthStore } from '@/stores/authStore';
 import { useLanguageStore } from '@/src/stores/languageStore';
 import NetworkSwitcher from '@/components/wallet/NetworkSwitcher';
 import { LanguageSwitcher } from '@/src/components/LanguageSwitcher';
 import { ThemeToggle } from '@/src/components/ThemeToggle';
+import { BiometricSettings } from '@/src/components/BiometricSettings';
+import { useBiometric } from '@/src/hooks/useBiometric';
 import { withErrorBoundary } from '@/src/hoc/withErrorBoundary';
 import { errorLogger } from '@/src/errors/logger';
 import { useTheme } from '@/src/theme/ThemeContext';
+import { requestRatingPrompt } from '@/src/services/ratingPrompt';
+import { useToast } from '@/src/hooks/useToast';
 import { useFavoritesStore } from '@/stores/favoritesStore';
 
 type Props = NativeStackScreenProps<MainStackParamList, 'Profile'>;
@@ -22,10 +26,37 @@ function ProfileContent({ navigation }: Props) {
   const { user, logout, appLockEnabled, setAppLockEnabled, lockTimeout, setLockTimeout } = useAuthStore();
   const { language } = useLanguageStore();
   const { colors, isDark } = useTheme();
+  const { showInfo, showError } = useToast();
+  const { isAvailable: biometricsAvailable, isEnrolled: biometricsEnrolled } = useBiometric();
   const [showLockTimeoutPicker, setShowLockTimeoutPicker] = useState(false);
   const favoriteCount = useFavoritesStore(
     (s) => s.favorites.length + s.favoriteCollections.length
   );
+
+  const handleRateApp = async () => {
+    try {
+      const result = await requestRatingPrompt();
+      if (result === 'unavailable') {
+        showInfo('Store reviews are not available on this device yet.');
+      }
+    } catch {
+      showError('Unable to open the store review prompt.');
+    }
+  };
+
+  const handleToggleAppLock = () => {
+    // Unlocking currently only has a working path through biometrics (PIN
+    // verification isn't implemented) — enabling it without biometrics set
+    // up would lock the user out of the app with no way back in.
+    if (!appLockEnabled && (!biometricsAvailable || !biometricsEnrolled)) {
+      Alert.alert(
+        'Biometric authentication required',
+        'App Lock currently unlocks with biometrics only. Set up fingerprint or face recognition on this device before enabling it.',
+      );
+      return;
+    }
+    setAppLockEnabled(!appLockEnabled);
+  };
 
   const handleSignOut = () => {
     Alert.alert(
@@ -286,16 +317,21 @@ function ProfileContent({ navigation }: Props) {
           <Text style={styles.rowLabel}>{t('profile.theme')}</Text>
           <ThemeToggle variant="switch" showLabel={false} />
         </View>
+        <TouchableOpacity style={styles.linkRow} onPress={handleRateApp}>
+          <Text style={styles.linkText}>Rate NFTopia</Text>
+          <Text style={styles.arrow}>→</Text>
+        </TouchableOpacity>
       </View>
 
       <View style={styles.card}>
         <Text style={styles.cardTitle} accessibilityRole="header">
           Security
         </Text>
+        <BiometricSettings />
         <View style={styles.row}>
           <Text style={styles.rowLabel}>App Lock</Text>
           <TouchableOpacity
-            onPress={() => setAppLockEnabled(!appLockEnabled)}
+            onPress={handleToggleAppLock}
             style={styles.switch}
             accessibilityRole="switch"
             accessibilityLabel="App lock"
